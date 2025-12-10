@@ -1,0 +1,226 @@
+# app_streamlit.py
+import streamlit as st
+import pandas as pd
+import os
+
+DATA_DIR = "data"
+BATCH_CSV = os.path.join(DATA_DIR, "clicks_batch.csv")
+
+st.title("Clickstream Analysis Dashboard (Demo)")
+
+if not os.path.exists(BATCH_CSV):
+    st.warning("Run generate_clicks.py to create a dataset first.")
+else:
+    df = pd.read_csv(BATCH_CSV, parse_dates=["event_time"])
+    st.header("Sample events")
+    st.dataframe(df.sample(min(200, len(df))))
+
+    st.header("Popular pages")
+    pop = df.page.value_counts().reset_index()
+    pop.columns = ["page","count"]
+    st.bar_chart(pop.set_index("page"))
+
+    st.header("Top session paths (sample)")
+    # build paths quickly in pandas (groupby session_id)
+    paths = df.sort_values(["user_id","session_id","event_time"]).groupby(["user_id","session_id"]).page.apply(lambda s: "->".join(s)).value_counts().reset_index()
+    paths.columns = ["path","count"]
+    st.write(paths.head(30))
+
+
+
+# clickstream_pipeline.py
+
+
+import os
+import sys
+from pyspark.sql import SparkSession, Window
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import argparse
+import shutil
+
+GRAPHFRAMES_PKG = "graphframes:graphframes:0.8.2-spark3.3-s_2.12"  # may need version tweak
+
+def create_spark(app_name="ClickstreamApp"):
+    builder = SparkSession.builder.appName(app_name).master("local[*]")
+    # include GraphFrames package for graph operations
+    builder = builder.config("spark.jars.packages", GRAPHFRAMES_PKG)
+    spark = builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+def read_batch_csv(spark, path):
+    schema = StructType([
+        StructField("user_id", StringType(), True),
+        StructField("session_id", StringType(), True),
+        StructField("event_time", StringType(), True),
+        StructField("page", StringType(), True),
+        StructField("referrer", StringType(), True),
+        StructField("device", StringType(), True),
+        StructField("country", StringType(), True),
+    ])
+    df = spark.read.option("header", True).schema(schema).csv(path)
+    df = df.withColumn("event_time_ts", to_timestamp("event_time"))
+    return df
+
+def batch_analysis(spark, df):
+    df = df.withColumn("event_time_ts", to_timestamp("event_time"))
+
+    # Session-level stats
+    sess = df.groupBy("user_id", "session_id") \
+             .agg(
+                 min("event_time_ts").alias("session_start"),
+                 max("event_time_ts").alias("session_end"),
+                 (unix_timestamp(max("event_time_ts")) - unix_timestamp(min("event_time_ts"))).alias("duration_seconds"),
+                 count("*").alias("events_count"),
+                 collect_list(struct("event_time_ts","page")).alias("events")
+             )
+
+    # Build session paths (ordered list of pages)
+    def build_path(events):
+        events_sorted = sorted(events, key=lambda x: x['event_time_ts'])
+        pages = [e['page'] for e in events_sorted]
+        return "->".join(pages)
+
+    from pyspark.sql.types import StringType
+    from pyspark.sql.functions import udf
+    build_path_udf = udf(lambda ev: "->".join([e['page'] for e in sorted(ev, key=lambda x: x['event_time_ts'])]), StringType())
+    sess = sess.withColumn("path", build_path_udf("events"))
+
+    # Popular pages
+    popular = df.groupBy("page").count().orderBy(desc("count"))
+
+    # Drop-offs: last page in session
+    last_page = df.withColumn("rn", row_number().over(Window.partitionBy("user_id","session_id").orderBy(desc("event_time_ts")))) \
+                  .filter(col("rn") == 1) \
+                  .groupBy("page").count().orderBy(desc("count"))
+
+    # Top paths
+    top_paths = sess.groupBy("path").count().orderBy(desc("count"))
+
+    # Show / return
+    print("=== Popular Pages ===")
+    popular.show(10, False)
+    print("=== Drop-off Pages (session last pages) ===")
+    last_page.show(10, False)
+    print("=== Top Paths ===")
+    top_paths.show(10, False)
+
+    # return useful DataFrames
+    return {
+        "sessions": sess,
+        "popular_pages": popular,
+        "dropoff_pages": last_page,
+        "top_paths": top_paths
+    }
+
+
+def graph_analysis(spark, df):
+    # Build transitions: from page -> to_page within same session order
+    w = Window.partitionBy("user_id", "session_id").orderBy("event_time_ts")
+    df_ordered = df.withColumn("next_page", lead("page").over(w))
+    edges = df_ordered.filter(col("next_page").isNotNull()) \
+                      .groupBy("page", "next_page").count() \
+                      .withColumnRenamed("page", "src") \
+                      .withColumnRenamed("next_page", "dst") \
+                      .withColumnRenamed("count", "weight")
+    verts = df.select("page").distinct().withColumnRenamed("page","id")
+
+    # GraphFrames (import at runtime)
+    from graphframes import GraphFrame
+    g = GraphFrame(verts, edges)
+
+    # Most common transitions
+    print("=== Top transitions (src->dst) ===")
+    edges.orderBy(desc("weight")).show(10, False)
+
+    # PageRank to find important pages in navigation graph
+    pr = g.pageRank(resetProbability=0.15, maxIter=10)
+    print("=== PageRank scores ===")
+    pr.vertices.orderBy(desc("pagerank")).show(10, False)
+
+    return {"graph": g, "edges": edges, "page_rank": pr.vertices}
+
+
+def ml_sessions_clustering(spark, sessions_df):
+    # sessions_df contains path, session_start, session_end, duration_seconds, events_count
+    from pyspark.ml.feature import VectorAssembler, StandardScaler
+    from pyspark.ml.clustering import KMeans
+
+    feats = sessions_df.select("session_id", "user_id", "duration_seconds", "events_count")
+    feats = feats.fillna(0, subset=["duration_seconds","events_count"])
+    assembler = VectorAssembler(inputCols=["duration_seconds","events_count"], outputCol="raw_features")
+    vf = assembler.transform(feats)
+    scaler = StandardScaler(inputCol="raw_features", outputCol="features", withStd=True, withMean=False)
+    scaler_model = scaler.fit(vf)
+    scaled = scaler_model.transform(vf)
+
+    k = 3
+    km = KMeans(k=k, seed=42, featuresCol="features", predictionCol="cluster")
+    model = km.fit(scaled)
+    clustered = model.transform(scaled)
+
+    print("=== Cluster counts ===")
+    clustered.groupBy("cluster").count().show()
+
+    # Merge cluster labels back to sessions to investigate drop-offs
+    clustered_sess = clustered.select("session_id","user_id","cluster")
+    return clustered_sess, model
+
+def streaming_process(spark, stream_dir):
+    # This watches CSV files as they appear
+    schema = StructType([
+        StructField("user_id", StringType(), True),
+        StructField("session_id", StringType(), True),
+        StructField("event_time", StringType(), True),
+        StructField("page", StringType(), True),
+        StructField("referrer", StringType(), True),
+        StructField("device", StringType(), True),
+        StructField("country", StringType(), True),
+    ])
+    df = spark.readStream.option("header", True).schema(schema).csv(stream_dir)
+    df = df.withColumn("event_time_ts", to_timestamp("event_time"))
+
+    # Example: compute running counts of pages over sliding window
+    page_counts = df.groupBy(window(col("event_time_ts"), "5 minutes", "1 minute"), col("page")).count().orderBy(desc("count"))
+
+    # For demo, write counts to console
+    query = page_counts.writeStream.outputMode("complete").format("console").option("truncate", False).start()
+    return query
+
+def main(args):
+    spark = create_spark("ClickstreamPipeline")
+    data_dir = args.data or "data"
+    batch_file = os.path.join(data_dir, "clicks_batch.csv")
+    df_batch = read_batch_csv(spark, batch_file)
+
+    print("Running batch analysis...")
+    res = batch_analysis(spark, df_batch)
+
+    print("Running graph analysis...")
+    graph_res = graph_analysis(spark, df_batch)
+
+    print("Clustering sessions with MLlib (KMeans)...")
+    clustered_sess, km_model = ml_sessions_clustering(spark, res["sessions"])
+    print("Clustered sessions sample:")
+    clustered_sess.show(10, False)
+
+    if args.streaming:
+        stream_dir = data_dir
+        print("Starting structured streaming (watching directory):", stream_dir)
+        q = streaming_process(spark, stream_dir)
+        print("Stream started. Drop CSVs into", stream_dir, "to simulate incoming events.")
+        try:
+            q.awaitTermination()
+        except KeyboardInterrupt:
+            q.stop()
+            print("Stopped stream.")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", default="data", help="data dir")
+    parser.add_argument("--streaming", action="store_true", help="enable streaming watch")
+    args = parser.parse_args()
+    main(args)
